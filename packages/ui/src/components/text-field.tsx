@@ -2,8 +2,9 @@ import { TextField as Kobalte } from "@kobalte/core/text-field"
 import { createSignal, Show, splitProps } from "solid-js"
 import type { ComponentProps } from "solid-js"
 import { useI18n } from "../context/i18n"
-import { IconButton } from "./icon-button"
-import { Tooltip } from "./tooltip"
+import { IconButton } from "@opencode-ai/ui/icon-button"
+import { Icon } from "@opencode-ai/ui/icon"
+import { Tooltip } from "@opencode-ai/ui/tooltip"
 
 export interface TextFieldProps
   extends ComponentProps<typeof Kobalte.Input>,
@@ -27,6 +28,7 @@ export interface TextFieldProps
   error?: string
   variant?: "normal" | "ghost"
   copyable?: boolean
+  copyKind?: "clipboard" | "link"
   multiline?: boolean
 }
 
@@ -49,9 +51,22 @@ export function TextField(props: TextFieldProps) {
     "error",
     "variant",
     "copyable",
+    "copyKind",
     "multiline",
   ])
   const [copied, setCopied] = createSignal(false)
+
+  const label = () => {
+    if (copied()) return i18n.t("ui.textField.copied")
+    if (local.copyKind === "link") return i18n.t("ui.textField.copyLink")
+    return i18n.t("ui.textField.copyToClipboard")
+  }
+
+  const icon = () => {
+    if (copied()) return "check"
+    if (local.copyKind === "link") return "link"
+    return "copy"
+  }
 
   async function handleCopy() {
     const value = local.value ?? local.defaultValue ?? ""
@@ -61,7 +76,7 @@ export function TextField(props: TextFieldProps) {
   }
 
   function handleClick() {
-    if (local.copyable) handleCopy()
+    if (local.copyable) void handleCopy()
   }
 
   return (
@@ -93,20 +108,21 @@ export function TextField(props: TextFieldProps) {
         </Show>
         <Show when={local.copyable}>
           <Tooltip
-            value={copied() ? i18n.t("ui.textField.copied") : i18n.t("ui.textField.copyLink")}
+            appearance="standard"
+            value={label()}
             placement="top"
             gutter={4}
-            forceOpen={copied()}
+            forceOpen={copied() ? true : undefined}
             skipDelayDuration={0}
           >
             <IconButton
               type="button"
-              icon={copied() ? "check" : "link"}
+              icon={<Icon name={icon()} />}
               variant="ghost"
               onClick={handleCopy}
               tabIndex={-1}
               data-slot="input-copy-button"
-              aria-label={copied() ? i18n.t("ui.textField.copied") : i18n.t("ui.textField.copyLink")}
+              aria-label={label()}
             />
           </Tooltip>
         </Show>

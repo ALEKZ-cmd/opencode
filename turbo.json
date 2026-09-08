@@ -1,17 +1,75 @@
 {
-  "$schema": "https://turborepo.com/schema.json",
+  "$schema": "https://v2-8-13.turborepo.dev/schema.json",
+  "globalDependencies": [
+    "patches/**",
+    "bunfig.toml",
+    ".npmrc",
+    ".github/actions/setup-bun/**",
+    ".github/workflows/test.yml"
+  ],
+  "globalEnv": ["CI", "OPENCODE_DISABLE_SHARE"],
+  "globalPassThroughEnv": ["CI", "OPENCODE_DISABLE_SHARE"],
   "tasks": {
     "typecheck": {},
+    "test:components": {
+      "outputs": [],
+      "cache": false
+    },
+    "@opencode-ai/enterprise#typecheck": {
+      "dependsOn": ["@opencode-ai/core#typecheck"]
+    },
+    "@opencode-ai/sdk#typecheck": {
+      "dependsOn": ["@opencode-ai/core#typecheck"]
+    },
+    "@opencode-ai/server#typecheck": {
+      "dependsOn": ["@opencode-ai/core#typecheck"]
+    },
+    "@opencode-ai/simulation#typecheck": {
+      "dependsOn": ["@opencode-ai/core#typecheck"]
+    },
+    "@opencode-ai/tui#typecheck": {
+      "dependsOn": ["@opencode-ai/core#typecheck"]
+    },
     "build": {
-      "dependsOn": ["^build"],
+      "dependsOn": [],
       "outputs": ["dist/**"]
     },
-    "opencode#test": {
+    "@opencode-ai/codemode#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/core#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/function#test": {
+      "outputs": []
+    },
+    "@opencode-ai/cli#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/tui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/latex#test": {
       "dependsOn": ["^build"],
       "outputs": []
     },
     "@opencode-ai/app#test": {
       "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/ui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/session-ui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/sdk#verify:package": {
       "outputs": []
     }
   }

@@ -1,0 +1,1371 @@
+import { EventStreamCodec } from "@smithy/eventstream-codec"
+import { fromUtf8, toUtf8 } from "@smithy/util-utf8"
+import { describe, expect } from "bun:test"
+import { Effect } from "effect"
+import {
+  CacheHint,
+  GenerationOptions,
+  LLM,
+  LLMRequest,
+  Message,
+  ToolCallPart,
+  ToolChoice,
+  ToolDefinition,
+} from "../../src/index.js"
+import { LLMClient } from "../../src/route.js"
+import { compileRequest } from "../../src/route/client.js"
+import { AmazonBedrock } from "../../src/providers.js"
+import * as BedrockConverse from "../../src/protocols/bedrock-converse.js"
+import { it } from "../lib/effect.js"
+import { fixedResponse } from "../lib/http.js"
+import {
+  eventSummary,
+  expectWeatherToolLoop,
+  runWeatherToolLoop,
+  weatherTool,
+  weatherToolLoopRequest,
+  weatherToolName,
+} from "../recorded-scenarios.js"
+import { recordedTests } from "../recorded-test.js"
+
+const codec = new EventStreamCodec(toUtf8, fromUtf8)
+const utf8Encoder = new TextEncoder()
+
+// Build a single AWS event-stream frame for a Converse stream event. Each
+// frame carries `:message-type=event` + `:event-type=<name>` headers and a
+// JSON payload body.
+const eventFrame = (type: string, payload: object) =>
+  codec.encode({
+    headers: {
+      ":message-type": { type: "string", value: "event" },
+      ":event-type": { type: "string", value: type },
+      ":content-type": { type: "string", value: "application/json" },
+    },
+    body: utf8Encoder.encode(JSON.stringify(payload)),
+  })
+
+const exceptionFrame = (type: string, payload: object) =>
+  codec.encode({
+    headers: {
+      ":message-type": { type: "string", value: "exception" },
+      ":exception-type": { type: "string", value: type },
+      ":content-type": { type: "string", value: "application/json" },
+    },
+    body: utf8Encoder.encode(JSON.stringify(payload)),
+  })
+
+const errorFrame = (code: string, message: string) =>
+  codec.encode({
+    headers: {
+      ":message-type": { type: "string", value: "error" },
+      ":error-code": { type: "string", value: code },
+      ":error-message": { type: "string", value: message },
+    },
+    body: new Uint8Array(),
+  })
+
+const concat = (frames: ReadonlyArray<Uint8Array>) => {
+  const total = frames.reduce((sum, frame) => sum + frame.length, 0)
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const frame of frames) {
+    out.set(frame, offset)
+    offset += frame.length
+  }
+  return out
+}
+
+const eventStreamBody = (...payloads: ReadonlyArray<readonly [string, object]>) =>
+  concat(payloads.map(([type, payload]) => eventFrame(type, payload)))
+
+// Override the default SSE content-type with the binary event-stream type so
+// the cassette layer treats the body as bytes when recording.
+const fixedBytes = (bytes: Uint8Array) =>
+  fixedResponse(bytes.slice().buffer, { headers: { "content-type": "application/vnd.amazon.eventstream" } })
+
+const model = AmazonBedrock.configure({
+  baseURL: "https://bedrock-runtime.test",
+  apiKey: "test-bearer",
+}).model("anthropic.claude-3-5-sonnet-20240620-v1:0")
+
+const baseRequest = LLM.request({
+  id: "req_1",
+  model,
+  system: "You are concise.",
+  prompt: "Say hello.",
+  // Wire-shape assertions in this file predate the `cache: "auto"` default;
+  // pin the policy off so they only exercise the lowering path itself.
+  cache: "none",
+  generation: { maxTokens: 64, temperature: 0 },
+})
+
+describe("Bedrock Converse route", () => {
+  it.effect("prepares Converse target with system, inference config, and messages", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(baseRequest)
+
+      expect(prepared.body).toEqual({
+        modelId: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        system: [{ text: "You are concise." }],
+        messages: [{ role: "user", content: [{ text: "Say hello." }] }],
+        inferenceConfig: { maxTokens: 64, temperature: 0 },
+      })
+    }),
+  )
+
+  it.effect("passes topK through additionalModelRequestFields as top_k", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLMRequest.update(baseRequest, {
+          generation: GenerationOptions.make({ maxTokens: 64, temperature: 0, topK: 40 }),
+        }),
+      )
+
+      // Converse's inferenceConfig has no topK; Anthropic/Nova read it from
+      // additionalModelRequestFields as top_k.
+      expect(prepared.body.inferenceConfig).toEqual({ maxTokens: 64, temperature: 0 })
+      expect(prepared.body.additionalModelRequestFields).toEqual({ top_k: 40 })
+    }),
+  )
+
+  it.effect("omits additionalModelRequestFields when topK is unset", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(baseRequest)
+      expect(prepared.body.additionalModelRequestFields).toBeUndefined()
+    }),
+  )
+
+  it.effect("lowers chronological system updates to wrapped user text in order", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [Message.user("Before."), Message.system("Update."), Message.assistant("After.")],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body.messages).toEqual([
+        { role: "user", content: [{ text: "Before." }, { text: "<system-update>\nUpdate.\n</system-update>" }] },
+        { role: "assistant", content: [{ text: "After." }] },
+      ])
+    }),
+  )
+
+  it.effect("prepares tool config with toolSpec and toolChoice", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLMRequest.update(baseRequest, {
+          tools: [
+            ToolDefinition.make({
+              name: "lookup",
+              description: "Lookup data",
+              inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+            }),
+          ],
+          toolChoice: ToolChoice.make({ type: "required" }),
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        toolConfig: {
+          tools: [
+            {
+              toolSpec: {
+                name: "lookup",
+                description: "Lookup data",
+                inputSchema: {
+                  json: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+                },
+              },
+            },
+          ],
+          toolChoice: { any: {} },
+        },
+      })
+    }),
+  )
+
+  it.effect("keeps tools and omits the unsupported choice when tool choice is none", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLMRequest.update(baseRequest, {
+          tools: [
+            ToolDefinition.make({
+              name: "lookup",
+              description: "Lookup data",
+              inputSchema: { type: "object", properties: { query: { type: "string" } } },
+            }),
+          ],
+          toolChoice: ToolChoice.make({ type: "none" }),
+        }),
+      )
+
+      expect(prepared.body.toolConfig).toMatchObject({
+        tools: [
+          {
+            toolSpec: {
+              name: "lookup",
+              description: "Lookup data",
+              inputSchema: { json: { type: "object", properties: { query: { type: "string" } } } },
+            },
+          },
+        ],
+      })
+      expect(prepared.body.toolConfig?.toolChoice).toBeUndefined()
+    }),
+  )
+
+  it.effect("lowers assistant tool-call + tool-result message history", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_history",
+          model,
+          messages: [
+            Message.user("What is the weather?"),
+            Message.assistant([ToolCallPart.make({ id: "tool_1", name: "lookup", input: { query: "weather" } })]),
+            Message.tool({ id: "tool_1", name: "lookup", result: { forecast: "sunny" } }),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        messages: [
+          { role: "user", content: [{ text: "What is the weather?" }] },
+          {
+            role: "assistant",
+            content: [{ toolUse: { toolUseId: "tool_1", name: "lookup", input: { query: "weather" } } }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                toolResult: {
+                  toolUseId: "tool_1",
+                  content: [{ json: { forecast: "sunny" } }],
+                  status: "success",
+                },
+              },
+            ],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("merges parallel tool results into one user message", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_parallel_history",
+          model,
+          messages: [
+            Message.user("Compare the weather."),
+            Message.assistant([
+              ToolCallPart.make({ id: "tool_paris", name: "lookup", input: { city: "Paris" } }),
+              ToolCallPart.make({ id: "tool_london", name: "lookup", input: { city: "London" } }),
+            ]),
+            Message.tool({ id: "tool_paris", name: "lookup", result: { forecast: "sunny" } }),
+            Message.tool({ id: "tool_london", name: "lookup", result: { forecast: "rainy" } }),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body.messages).toEqual([
+        { role: "user", content: [{ text: "Compare the weather." }] },
+        {
+          role: "assistant",
+          content: [
+            { toolUse: { toolUseId: "tool_paris", name: "lookup", input: { city: "Paris" } } },
+            { toolUse: { toolUseId: "tool_london", name: "lookup", input: { city: "London" } } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              toolResult: {
+                toolUseId: "tool_paris",
+                content: [{ json: { forecast: "sunny" } }],
+                status: "success",
+              },
+            },
+            {
+              toolResult: {
+                toolUseId: "tool_london",
+                content: [{ json: { forecast: "rainy" } }],
+                status: "success",
+              },
+            },
+          ],
+        },
+      ])
+    }),
+  )
+
+  it.effect("lowers image content in tool-result messages", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_tool_image",
+          model,
+          messages: [
+            Message.user("Capture the screen."),
+            Message.assistant([ToolCallPart.make({ id: "tool_1", name: "screenshot", input: {} })]),
+            Message.tool({
+              id: "tool_1",
+              name: "screenshot",
+              result: {
+                type: "content",
+                value: [
+                  { type: "text", text: "Screenshot captured." },
+                  { type: "file", uri: "data:image/png;base64,AAAA", mime: "image/png" },
+                ],
+              },
+            }),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        messages: [
+          { role: "user", content: [{ text: "Capture the screen." }] },
+          {
+            role: "assistant",
+            content: [{ toolUse: { toolUseId: "tool_1", name: "screenshot", input: {} } }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                toolResult: {
+                  toolUseId: "tool_1",
+                  content: [{ text: "Screenshot captured." }, { image: { format: "png", source: { bytes: "AAAA" } } }],
+                  status: "success",
+                },
+              },
+            ],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("decodes text-delta + messageStop + metadata usage from binary event stream", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { text: "Hello" } }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { text: "!" } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+        ["metadata", { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.text).toBe("Hello!")
+      const finishes = response.events.filter((event) => event.type === "finish")
+      // Bedrock splits the finish across `messageStop` (carries reason) and
+      // `metadata` (carries usage). We consolidate them into a single
+      // terminal `finish` event with both.
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0]).toMatchObject({
+        type: "finish",
+        reason: { normalized: "stop", raw: "end_turn" },
+      })
+      expect(response.usage).toMatchObject({
+        inputTokens: 5,
+        outputTokens: 2,
+        totalTokens: 7,
+      })
+    }),
+  )
+
+  it.effect("maps truncation and malformed output stop reasons", () =>
+    Effect.gen(function* () {
+      const reasons = [
+        ["model_context_window_exceeded", "length"],
+        ["malformed_model_output", "error"],
+        ["malformed_tool_use", "error"],
+      ] as const
+
+      for (const [raw, normalized] of reasons) {
+        const response = yield* LLMClient.generate(baseRequest).pipe(
+          Effect.provide(fixedBytes(eventStreamBody(["messageStop", { stopReason: raw }]))),
+        )
+        expect(response.finishReason).toEqual({ normalized, raw })
+      }
+    }),
+  )
+
+  it.effect("adds cache reads and writes to Bedrock input usage", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { text: "Hello" } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+        [
+          "metadata",
+          {
+            usage: {
+              inputTokens: 5,
+              outputTokens: 2,
+              totalTokens: 12,
+              cacheReadInputTokens: 3,
+              cacheWriteInputTokens: 2,
+            },
+          },
+        ],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.usage).toMatchObject({
+        inputTokens: 10,
+        nonCachedInputTokens: 5,
+        cacheReadInputTokens: 3,
+        cacheWriteInputTokens: 2,
+        outputTokens: 2,
+        totalTokens: 12,
+      })
+    }),
+  )
+
+  it.effect("preserves usage across later metadata events without usage", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStop", { stopReason: "end_turn" }],
+        ["metadata", { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } }],
+        ["metadata", { metrics: { latencyMs: 100 } }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.usage).toMatchObject({ inputTokens: 5, outputTokens: 2, totalTokens: 7 })
+    }),
+  )
+
+  it.effect("assembles streamed tool call input", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        [
+          "contentBlockStart",
+          {
+            contentBlockIndex: 0,
+            start: { toolUse: { toolUseId: "tool_1", name: "lookup" } },
+          },
+        ],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { toolUse: { input: '{"query"' } } }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { toolUse: { input: ':"weather"}' } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "tool_use" }],
+      )
+      const response = yield* LLMClient.generate(
+        LLMRequest.update(baseRequest, {
+          tools: [ToolDefinition.make({ name: "lookup", description: "Lookup", inputSchema: { type: "object" } })],
+        }),
+      ).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.toolCalls).toEqual([
+        { type: "tool-call", id: "tool_1", name: "lookup", input: { query: "weather" } },
+      ])
+      const events = response.events.filter((event) => event.type === "tool-input-delta")
+      expect(events).toEqual([
+        { type: "tool-input-delta", id: "tool_1", name: "lookup", text: '{"query"', input: {} },
+        {
+          type: "tool-input-delta",
+          id: "tool_1",
+          name: "lookup",
+          text: ':"weather"}',
+          input: { query: "weather" },
+        },
+      ])
+      expect(response.events.at(-1)).toMatchObject({
+        type: "finish",
+        reason: { normalized: "tool-calls", raw: "tool_use" },
+      })
+    }),
+  )
+
+  it.effect("recovers incomplete tool input at finalization", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        [
+          "contentBlockStart",
+          {
+            contentBlockIndex: 0,
+            start: { toolUse: { toolUseId: "tool_1", name: "lookup" } },
+          },
+        ],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { toolUse: { input: '{"query":"partial' } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.events.find((event) => event.type === "tool-call")).toMatchObject({
+        id: "tool_1",
+        name: "lookup",
+        input: { query: "partial" },
+      })
+      expect(response.finishReason).toEqual({ normalized: "tool-calls", raw: "end_turn" })
+    }),
+  )
+
+  it.effect("decodes reasoning deltas", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { text: "Let me think." } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.reasoning).toBe("Let me think.")
+    }),
+  )
+
+  it.effect("preserves streamed reasoning signatures for continuation lowering", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { text: "Let me think." } } }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { signature: "sig_1" } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+      const reasoning = response.events.find((event) => event.type === "reasoning-end")
+
+      expect(reasoning).toEqual({
+        type: "reasoning-end",
+        id: "reasoning-0",
+        providerMetadata: { bedrock: { signature: "sig_1" } },
+      })
+
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [
+            Message.assistant([
+              { type: "reasoning", text: "Let me think.", providerMetadata: reasoning?.providerMetadata },
+            ]),
+          ],
+          cache: "none",
+        }),
+      )
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "assistant",
+          content: [{ reasoningContent: { reasoningText: { text: "Let me think.", signature: "sig_1" } } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("round-trips reassigned provider reasoning and usage metadata in its own namespace", () =>
+    Effect.gen(function* () {
+      const compatible = model.route.with({ provider: "custom-bedrock" }).model({ id: model.id })
+      const redactedData = "cmVkYWN0ZWQtdGhpbmtpbmc="
+      const response = yield* LLMClient.generate(LLMRequest.update(baseRequest, { model: compatible })).pipe(
+        Effect.provide(
+          fixedBytes(
+            eventStreamBody(
+              ["messageStart", { role: "assistant" }],
+              ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { text: "Let me think." } } }],
+              ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { signature: "custom_sig" } } }],
+              ["contentBlockStop", { contentBlockIndex: 0 }],
+              [
+                "contentBlockDelta",
+                { contentBlockIndex: 1, delta: { reasoningContent: { redactedContent: redactedData } } },
+              ],
+              ["contentBlockStop", { contentBlockIndex: 1 }],
+              ["messageStop", { stopReason: "end_turn" }],
+              ["metadata", { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } }],
+            ),
+          ),
+        ),
+      )
+
+      expect(response.message.content).toEqual([
+        {
+          type: "reasoning",
+          text: "Let me think.",
+          providerMetadata: { "custom-bedrock": { signature: "custom_sig" } },
+        },
+        { type: "reasoning", text: "", providerMetadata: { "custom-bedrock": { redactedData } } },
+      ])
+      expect(response.usage?.providerMetadata).toEqual({
+        "custom-bedrock": { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      })
+
+      const prepared = yield* compileRequest(
+        LLM.request({ model: compatible, messages: [response.message], cache: "none" }),
+      )
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "assistant",
+          content: [
+            { reasoningContent: { reasoningText: { text: "Let me think.", signature: "custom_sig" } } },
+            { reasoningContent: { redactedContent: redactedData } },
+          ],
+        },
+      ])
+    }),
+  )
+
+  it.effect("preserves reasoning signatures when contentBlockStop is missing", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(baseRequest).pipe(
+        Effect.provide(
+          fixedBytes(
+            eventStreamBody(
+              ["messageStart", { role: "assistant" }],
+              ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { text: "Let me think." } } }],
+              ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { signature: "sig_1" } } }],
+              ["messageStop", { stopReason: "end_turn" }],
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.find((event) => event.type === "reasoning-delta" && event.text === "")).toEqual({
+        type: "reasoning-delta",
+        id: "reasoning-0",
+        text: "",
+        providerMetadata: { bedrock: { signature: "sig_1" } },
+      })
+      expect(response.message.content).toEqual([
+        {
+          type: "reasoning",
+          text: "Let me think.",
+          providerMetadata: { bedrock: { signature: "sig_1" } },
+        },
+      ])
+
+      const prepared = yield* compileRequest(LLM.request({ model, messages: [response.message], cache: "none" }))
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "assistant",
+          content: [{ reasoningContent: { reasoningText: { text: "Let me think.", signature: "sig_1" } } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("preserves signature-only reasoning blocks", () =>
+    Effect.gen(function* () {
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { signature: "sig_1" } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.message.content).toEqual([
+        { type: "reasoning", text: "", providerMetadata: { bedrock: { signature: "sig_1" } } },
+      ])
+    }),
+  )
+
+  it.effect("accepts Vercel-compatible redacted reasoning data deltas", () =>
+    Effect.gen(function* () {
+      const redactedData = "cmVkYWN0ZWQtdGhpbmtpbmc="
+      const body = eventStreamBody(
+        ["messageStart", { role: "assistant" }],
+        ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { data: redactedData } } }],
+        ["contentBlockStop", { contentBlockIndex: 0 }],
+        ["messageStop", { stopReason: "end_turn" }],
+      )
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.events.find((event) => event.type === "reasoning-delta" && event.text === "")).toEqual({
+        type: "reasoning-delta",
+        id: "reasoning-0",
+        text: "",
+        providerMetadata: { bedrock: { redactedData } },
+      })
+      expect(response.message.content).toEqual([
+        { type: "reasoning", text: "", providerMetadata: { bedrock: { redactedData } } },
+      ])
+    }),
+  )
+
+  it.effect("round-trips streamed redacted reasoning with tool use into a continuation request", () =>
+    Effect.gen(function* () {
+      // Bedrock represents redactedContent blobs as base64 strings on its JSON
+      // wire. The provider owns the payload and requires byte-exact replay.
+      const redactedData = "cmVkYWN0ZWQtdGhpbmtpbmc="
+      const response = yield* LLMClient.generate(
+        LLMRequest.update(baseRequest, {
+          tools: [ToolDefinition.make({ name: "lookup", description: "Lookup data", inputSchema: { type: "object" } })],
+        }),
+      ).pipe(
+        Effect.provide(
+          fixedBytes(
+            eventStreamBody(
+              ["messageStart", { role: "assistant" }],
+              [
+                "contentBlockDelta",
+                { contentBlockIndex: 0, delta: { reasoningContent: { redactedContent: redactedData } } },
+              ],
+              ["contentBlockStop", { contentBlockIndex: 0 }],
+              [
+                "contentBlockStart",
+                {
+                  contentBlockIndex: 1,
+                  start: { toolUse: { toolUseId: "tool_1", name: "lookup" } },
+                },
+              ],
+              ["contentBlockDelta", { contentBlockIndex: 1, delta: { toolUse: { input: '{"query":"weather"}' } } }],
+              ["contentBlockStop", { contentBlockIndex: 1 }],
+              ["messageStop", { stopReason: "tool_use" }],
+            ),
+          ),
+        ),
+      )
+      expect(response.events.find((event) => event.type === "reasoning-delta" && event.text === "")).toEqual({
+        type: "reasoning-delta",
+        id: "reasoning-0",
+        text: "",
+        providerMetadata: { bedrock: { redactedData } },
+      })
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [
+            Message.user("Say hello."),
+            response.message,
+            Message.tool({ id: "tool_1", name: "lookup", result: "sunny", resultType: "text" }),
+          ],
+          tools: [{ name: "lookup", description: "Lookup data", inputSchema: { type: "object" } }],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body.messages).toEqual([
+        { role: "user", content: [{ text: "Say hello." }] },
+        {
+          role: "assistant",
+          content: [
+            { reasoningContent: { redactedContent: redactedData } },
+            { toolUse: { toolUseId: "tool_1", name: "lookup", input: { query: "weather" } } },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ toolResult: { toolUseId: "tool_1", content: [{ text: "sunny" }], status: "success" } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("ignores unknown normal stream events", () =>
+    Effect.gen(function* () {
+      const body = concat([
+        eventFrame("messageStart", { role: "assistant" }),
+        eventFrame("futureEvent", { message: "Ignore this" }),
+        eventFrame("messageStop", { stopReason: "end_turn" }),
+      ])
+      const response = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)))
+
+      expect(response.finishReason).toEqual({ normalized: "stop", raw: "end_turn" })
+    }),
+  )
+
+  it.effect("fails unknown stream exceptions after message stop", () =>
+    Effect.gen(function* () {
+      const body = concat([
+        eventFrame("messageStart", { role: "assistant" }),
+        eventFrame("messageStop", { stopReason: "end_turn" }),
+        exceptionFrame("futureException", { message: "A future provider failure" }),
+      ])
+      const error = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)), Effect.flip)
+
+      expect(error).toMatchObject({ reason: { _tag: "UnknownProvider" }, message: "A future provider failure" })
+    }),
+  )
+
+  it.effect("classifies throttlingException as a rate limit", () =>
+    Effect.gen(function* () {
+      const payload = { message: "Slow down", details: { opaque: [1, 2] }, trace: "outer", p: "padding" }
+      const body = concat([
+        eventFrame("messageStart", { role: "assistant" }),
+        exceptionFrame("throttlingException", payload),
+      ])
+      const error = yield* LLMClient.generate(baseRequest).pipe(Effect.provide(fixedBytes(body)), Effect.flip)
+
+      expect(error).toMatchObject({ reason: { _tag: "RateLimit" }, message: "Slow down" })
+      expect(JSON.parse(error.reason.body ?? "")).toEqual({
+        headers: {
+          ":message-type": { type: "string", value: "exception" },
+          ":exception-type": { type: "string", value: "throttlingException" },
+          ":content-type": { type: "string", value: "application/json" },
+        },
+        body: JSON.stringify(payload),
+      })
+      expect(error.reason.http).toMatchObject({
+        status: 200,
+        headers: { "content-type": "application/vnd.amazon.eventstream" },
+      })
+    }),
+  )
+
+  it.effect("classifies input-too-long validation exceptions", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.generate(baseRequest).pipe(
+        Effect.provide(
+          fixedBytes(exceptionFrame("validationException", { message: "Input is too long for requested model" })),
+        ),
+        Effect.flip,
+      )
+
+      expect(error).toMatchObject({
+        reason: { _tag: "InvalidRequest", classification: "context-overflow" },
+        message: "Input is too long for requested model",
+      })
+    }),
+  )
+
+  it.effect("uses originalMessage from model stream exception frames", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.generate(baseRequest).pipe(
+        Effect.provide(
+          fixedBytes(
+            exceptionFrame("modelStreamErrorException", {
+              originalMessage: "Upstream model failed",
+              originalStatusCode: 500,
+            }),
+          ),
+        ),
+        Effect.flip,
+      )
+
+      expect(error).toMatchObject({ reason: { _tag: "ProviderInternal" }, message: "Upstream model failed" })
+    }),
+  )
+
+  it.effect("fails unmodeled AWS event-stream errors", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.generate(baseRequest).pipe(
+        Effect.provide(fixedBytes(errorFrame("BadStream", "Stream failed"))),
+        Effect.flip,
+      )
+
+      expect(error).toMatchObject({
+        reason: { _tag: "InvalidProviderOutput" },
+        message: "BadStream: Stream failed",
+      })
+      expect(JSON.parse(error.reason.body ?? "")).toMatchObject({
+        headers: { ":error-code": { value: "BadStream" } },
+        body: "",
+      })
+    }),
+  )
+
+  it.effect("retains malformed AWS payloads with headers and decode cause", () =>
+    Effect.gen(function* () {
+      const headers = {
+        ":message-type": { type: "string" as const, value: "event" },
+        ":event-type": { type: "string" as const, value: "messageStart" },
+      }
+      const body = '{"malformed":'
+      const error = yield* LLMClient.generate(baseRequest).pipe(
+        Effect.provide(fixedBytes(codec.encode({ headers, body: utf8Encoder.encode(body) }))),
+        Effect.flip,
+      )
+      expect(error.reason._tag).toBe("InvalidProviderOutput")
+      expect(JSON.parse(error.reason.body ?? "")).toEqual({ headers, body })
+      expect(error.reason.cause).toBeInstanceOf(Error)
+      expect(error.reason.http?.status).toBe(200)
+    }),
+  )
+
+  it.effect("rejects requests with no auth path", () =>
+    Effect.gen(function* () {
+      const unsignedModel = AmazonBedrock.configure({
+        baseURL: "https://bedrock-runtime.test",
+      }).model("anthropic.claude-3-5-sonnet-20240620-v1:0")
+      const error = yield* LLMClient.generate(LLMRequest.update(baseRequest, { model: unsignedModel })).pipe(
+        Effect.provide(fixedBytes(eventStreamBody(["messageStop", { stopReason: "end_turn" }]))),
+        Effect.flip,
+      )
+
+      expect(error.message).toContain("Bedrock Converse requires either route bearer auth or AWS credentials")
+    }),
+  )
+
+  it.effect("signs requests with SigV4 when AWS credentials are provided (deterministic plumbing check)", () =>
+    Effect.gen(function* () {
+      const signed = AmazonBedrock.configure({
+        baseURL: "https://bedrock-runtime.test",
+        credentials: {
+          region: "us-east-1",
+          accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+          secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        },
+      }).model("anthropic.claude-3-5-sonnet-20240620-v1:0")
+      const prepared = yield* compileRequest(LLMRequest.update(baseRequest, { model: signed }))
+
+      expect(prepared.route).toBe("bedrock-converse")
+      expect(prepared.model).toBe(signed)
+    }),
+  )
+
+  it.effect("emits cachePoint markers after system, user-text, and assistant-text with cache hints", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_cache",
+          model,
+          system: [{ type: "text", text: "System prefix.", cache }],
+          messages: [
+            Message.user([{ type: "text", text: "User prefix.", cache }]),
+            Message.assistant([{ type: "text", text: "Assistant prefix.", cache }]),
+          ],
+          generation: { maxTokens: 16, temperature: 0 },
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        // System: text block followed by cachePoint marker.
+        system: [{ text: "System prefix." }, { cachePoint: { type: "default" } }],
+        messages: [
+          {
+            role: "user",
+            content: [{ text: "User prefix." }, { cachePoint: { type: "default" } }],
+          },
+          {
+            role: "assistant",
+            content: [{ text: "Assistant prefix." }, { cachePoint: { type: "default" } }],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("does not emit cachePoint when no cache hint is set", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(baseRequest)
+      expect(prepared.body).toMatchObject({
+        system: [{ text: "You are concise." }],
+        messages: [{ role: "user", content: [{ text: "Say hello." }] }],
+      })
+    }),
+  )
+
+  it.effect("lowers image media into Bedrock image blocks", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_image",
+          model,
+          messages: [
+            Message.user([
+              { type: "text", text: "What is in this image?" },
+              { type: "media", mediaType: "image/png", data: "AAAA" },
+              { type: "media", mediaType: "image/jpeg", data: "BBBB" },
+              { type: "media", mediaType: "image/jpg", data: "CCCC" },
+              { type: "media", mediaType: "image/webp", data: "DDDD" },
+            ]),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { text: "What is in this image?" },
+              { image: { format: "png", source: { bytes: "AAAA" } } },
+              { image: { format: "jpeg", source: { bytes: "BBBB" } } },
+              // image/jpg is a non-standard alias; we map it to jpeg.
+              { image: { format: "jpeg", source: { bytes: "CCCC" } } },
+              { image: { format: "webp", source: { bytes: "DDDD" } } },
+            ],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("base64-encodes Uint8Array image bytes", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_image_bytes",
+          model,
+          messages: [Message.user([{ type: "media", mediaType: "image/png", data: new Uint8Array([1, 2, 3, 4, 5]) }])],
+        }),
+      )
+
+      // Buffer.from([1,2,3,4,5]).toString("base64") === "AQIDBAU="
+      expect(prepared.body).toMatchObject({
+        messages: [
+          {
+            role: "user",
+            content: [{ image: { format: "png", source: { bytes: "AQIDBAU=" } } }],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("lowers document media into Bedrock document blocks with format and name", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          id: "req_doc",
+          model,
+          cache: "none",
+          messages: [
+            Message.user([
+              { type: "text", text: "Summarize these documents." },
+              { type: "media", mediaType: "application/pdf", data: "UERGREFUQQ==", filename: "report.pdf" },
+              { type: "media", mediaType: "text/csv", data: "Q1NWREFUQQ==", filename: "data.csv" },
+            ]),
+          ],
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { text: "Summarize these documents." },
+              { document: { format: "pdf", name: "report.pdf", source: { bytes: "UERGREFUQQ==" } } },
+              { document: { format: "csv", name: "data.csv", source: { bytes: "Q1NWREFUQQ==" } } },
+            ],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("requires names for document media", () =>
+    Effect.gen(function* () {
+      const error = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [Message.user({ type: "media", mediaType: "application/pdf", data: "UERGREFUQQ==" })],
+        }),
+      ).pipe(Effect.flip)
+
+      expect(error.message).toContain("document media requires a filename")
+    }),
+  )
+
+  it.effect("passes named document-only messages through for provider validation", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          cache: "none",
+          messages: [
+            Message.user({
+              type: "media",
+              mediaType: "application/pdf",
+              data: "UERGREFUQQ==",
+              filename: "report.pdf",
+            }),
+          ],
+        }),
+      )
+
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "user",
+          content: [{ document: { format: "pdf", name: "report.pdf", source: { bytes: "UERGREFUQQ==" } } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("lowers document media in tool results", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          cache: "none",
+          messages: [
+            Message.assistant([ToolCallPart.make({ id: "call_1", name: "read", input: { path: "report.pdf" } })]),
+            Message.tool({
+              id: "call_1",
+              name: "read",
+              result: {
+                type: "content",
+                value: [
+                  { type: "text", text: "Read successfully" },
+                  {
+                    type: "file",
+                    uri: "data:application/pdf;base64,UERGREFUQQ==",
+                    mime: "application/pdf",
+                    name: "report",
+                  },
+                ],
+              },
+            }),
+          ],
+        }),
+      )
+
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "assistant",
+          content: [{ toolUse: { toolUseId: "call_1", name: "read", input: { path: "report.pdf" } } }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              toolResult: {
+                toolUseId: "call_1",
+                status: "success",
+                content: [
+                  { text: "Read successfully" },
+                  { document: { format: "pdf", name: "report", source: { bytes: "UERGREFUQQ==" } } },
+                ],
+              },
+            },
+          ],
+        },
+      ])
+    }),
+  )
+
+  it.effect("rejects unsupported image media types", () =>
+    Effect.gen(function* () {
+      const error = yield* compileRequest(
+        LLM.request({
+          id: "req_bad_image",
+          model,
+          messages: [Message.user([{ type: "media", mediaType: "image/svg+xml", data: "x" }])],
+        }),
+      ).pipe(Effect.flip)
+
+      expect(error.message).toContain("Bedrock Converse does not support image media type image/svg+xml")
+    }),
+  )
+
+  it.effect("rejects unsupported document media types", () =>
+    Effect.gen(function* () {
+      const error = yield* compileRequest(
+        LLM.request({
+          id: "req_bad_doc",
+          model,
+          messages: [Message.user([{ type: "media", mediaType: "application/x-tar", data: "x", filename: "a.tar" }])],
+        }),
+      ).pipe(Effect.flip)
+
+      expect(error.message).toContain("Bedrock Converse does not support media type application/x-tar")
+    }),
+  )
+
+  it.effect("maps ttlSeconds >= 3600 to cachePoint ttl: '1h'", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral", ttlSeconds: 3600 })
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          system: [{ type: "text", text: "system", cache }],
+          prompt: "hi",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        system: [{ text: "system" }, { cachePoint: { type: "default", ttl: "1h" } }],
+      })
+    }),
+  )
+
+  it.effect("appends cachePoint after marked tool definitions and tool-result blocks", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          tools: [{ name: "lookup", description: "lookup", inputSchema: { type: "object", properties: {} }, cache }],
+          messages: [
+            Message.user("What's the weather?"),
+            Message.assistant([ToolCallPart.make({ id: "call_1", name: "lookup", input: {} })]),
+            Message.tool({ id: "call_1", name: "lookup", result: { temp: 72 }, cache }),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        toolConfig: {
+          tools: [{ toolSpec: { name: "lookup" } }, { cachePoint: { type: "default" } }],
+        },
+        messages: [
+          { role: "user", content: [{ text: "What's the weather?" }] },
+          { role: "assistant", content: [{ toolUse: { toolUseId: "call_1" } }] },
+          {
+            role: "user",
+            content: [{ toolResult: { toolUseId: "call_1" } }, { cachePoint: { type: "default" } }],
+          },
+        ],
+      })
+    }),
+  )
+
+  it.effect("drops cachePoint markers past the 4-per-request cap", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          system: [
+            { type: "text", text: "a", cache },
+            { type: "text", text: "b", cache },
+            { type: "text", text: "c", cache },
+            { type: "text", text: "d", cache },
+            { type: "text", text: "e", cache },
+            { type: "text", text: "f", cache },
+          ],
+          prompt: "hi",
+        }),
+      )
+
+      const system = (prepared.body as { system: Array<{ cachePoint?: unknown }> }).system
+      expect(system.filter((part) => "cachePoint" in part)).toHaveLength(4)
+    }),
+  )
+})
+
+// Live recorded integration tests. Run with `RECORD=true AWS_ACCESS_KEY_ID=...
+// AWS_SECRET_ACCESS_KEY=... [AWS_SESSION_TOKEN=...] bun run test ...` to refresh
+// cassettes; replay is the default and works without credentials.
+//
+// Region is pinned to us-east-1 in tests so the request URL is stable across
+// machines on replay. If you need to record from a different region (e.g. your
+// account has access elsewhere), pass `BEDROCK_RECORDING_REGION=eu-west-1` —
+// but then commit the resulting cassette and others should record from the
+// same region too.
+const RECORDING_REGION = process.env.BEDROCK_RECORDING_REGION ?? "us-east-1"
+
+const recordedModel = () =>
+  AmazonBedrock.configure({
+    // Most newer Anthropic models on Bedrock require a cross-region inference
+    // profile (`us.` prefix). Nova does not require an Anthropic use-case form
+    // and is on-demand-throughput accessible by default for most accounts.
+    credentials: {
+      region: RECORDING_REGION,
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? "fixture",
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? "fixture",
+      sessionToken: process.env.AWS_SESSION_TOKEN,
+    },
+  }).model(process.env.BEDROCK_MODEL_ID ?? "us.amazon.nova-micro-v1:0")
+
+const recorded = recordedTests({
+  prefix: "bedrock-converse",
+  provider: "amazon-bedrock",
+  protocol: "bedrock-converse",
+  requires: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+})
+
+describe("Bedrock Converse recorded", () => {
+  recorded.effect("streams text", () =>
+    Effect.gen(function* () {
+      const llm = yield* LLMClient.Service
+      const response = yield* llm.generate(
+        LLM.request({
+          id: "recorded_bedrock_text",
+          model: recordedModel(),
+          system: "Reply with the single word 'Hello'.",
+          prompt: "Say hello.",
+          cache: "none",
+          generation: { maxTokens: 16, temperature: 0 },
+        }),
+      )
+
+      expect(eventSummary(response.events)).toEqual([
+        { type: "text", value: "Hello" },
+        { type: "finish", reason: "stop", usage: { inputTokens: 12, outputTokens: 2, totalTokens: 14 } },
+      ])
+    }),
+  )
+
+  recorded.effect.with("streams a tool call", { tags: ["tool"] }, () =>
+    Effect.gen(function* () {
+      const llm = yield* LLMClient.Service
+      const response = yield* llm.generate(
+        LLM.request({
+          id: "recorded_bedrock_tool_call",
+          model: recordedModel(),
+          system: "Call tools exactly as requested.",
+          prompt: "Call get_weather with city exactly Paris.",
+          tools: [weatherTool],
+          toolChoice: ToolChoice.make(weatherTool),
+          cache: "none",
+          generation: { maxTokens: 80, temperature: 0 },
+        }),
+      )
+
+      expect(eventSummary(response.events)).toEqual([
+        { type: "tool-call", name: weatherToolName, input: { city: "Paris" } },
+        { type: "finish", reason: "tool-calls", usage: { inputTokens: 419, outputTokens: 16, totalTokens: 435 } },
+      ])
+    }),
+  )
+
+  recorded.effect.with("drives a tool loop", { tags: ["tool", "tool-loop", "golden"] }, () =>
+    Effect.gen(function* () {
+      expectWeatherToolLoop(
+        yield* runWeatherToolLoop(
+          weatherToolLoopRequest({
+            id: "recorded_bedrock_tool_loop",
+            model: recordedModel(),
+          }),
+        ),
+      )
+    }),
+  )
+
+  recorded.effect.with("continues after parallel tool results", { tags: ["tool", "tool-loop", "parallel"] }, () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(
+        LLM.request({
+          id: "recorded_bedrock_parallel_tool_results",
+          model: recordedModel(),
+          system: "After receiving both tool results, reply exactly: Paris is sunny; London is rainy.",
+          messages: [
+            Message.user("Compare the weather in Paris and London."),
+            Message.assistant([
+              ToolCallPart.make({ id: "weather_paris", name: weatherToolName, input: { city: "Paris" } }),
+              ToolCallPart.make({ id: "weather_london", name: weatherToolName, input: { city: "London" } }),
+            ]),
+            Message.tool({
+              id: "weather_paris",
+              name: weatherToolName,
+              result: { temperature: 22, condition: "sunny" },
+            }),
+            Message.tool({
+              id: "weather_london",
+              name: weatherToolName,
+              result: { temperature: 14, condition: "rainy" },
+            }),
+          ],
+          tools: [weatherTool],
+          cache: "none",
+          generation: { maxTokens: 40, temperature: 0 },
+        }),
+      )
+
+      expect(response.text.trim()).toBe("Paris is sunny; London is rainy.")
+      expect(response.finishReason?.normalized).toBe("stop")
+    }),
+  )
+})

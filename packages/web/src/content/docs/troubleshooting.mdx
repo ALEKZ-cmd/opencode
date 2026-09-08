@@ -37,6 +37,20 @@ This directory contains:
 
 ---
 
+## Uninstall
+
+To uninstall the OpenCode CLI and remove its related files, run:
+
+```bash
+opencode uninstall
+```
+
+The command shows what will be removed and asks for confirmation. See the [CLI reference](/docs/cli#uninstall) for options to keep your configuration or application data.
+
+To remove OpenCode Desktop, uninstall the application through your operating system's app management tools.
+
+---
+
 ## Desktop app
 
 OpenCode Desktop runs a local OpenCode server (the `opencode-cli` sidecar) in the background. Most issues are caused by a misbehaving plugin, a corrupted cache, or a bad server setting.
@@ -133,6 +147,12 @@ On Linux, some Wayland setups can cause blank windows or compositor errors.
 ### Windows: WebView2 runtime
 
 On Windows, OpenCode Desktop requires the Microsoft Edge **WebView2 Runtime**. If the app opens to a blank window or won't start, install/update WebView2 and try again.
+
+---
+
+### Windows: General performance issues
+
+If you're experiencing slow performance, file access issues, or terminal problems on Windows, try using [WSL (Windows Subsystem for Linux)](/docs/windows-wsl). WSL provides a Linux environment that works more seamlessly with OpenCode's features.
 
 ---
 

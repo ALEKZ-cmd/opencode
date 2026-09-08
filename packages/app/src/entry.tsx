@@ -1,76 +1,97 @@
 // @refresh reload
+
+import { init } from "@sentry/solid"
 import { render } from "solid-js/web"
 import { AppBaseProviders, AppInterface } from "@/app"
-import { Platform, PlatformProvider } from "@/context/platform"
-import { dict as en } from "@/i18n/en"
-import { dict as zh } from "@/i18n/zh"
+import { loadInitialLocale } from "@/runtime/i18n/language"
+import { PlatformProvider } from "@/runtime/platform/platform"
+import { createWebPlatform } from "@/runtime/platform/web"
+import en from "@/runtime/i18n/en"
+import zh from "@/runtime/i18n/zh"
+import { authFromToken } from "@/runtime/server/api"
 import pkg from "../package.json"
+import { ServerConnection } from "@/runtime/server/registry"
+
+const getLocale = () => {
+  if (typeof navigator !== "object") return "en" as const
+  const languages = navigator.languages?.length ? navigator.languages : [navigator.language]
+  for (const language of languages) {
+    if (!language) continue
+    if (language.toLowerCase().startsWith("zh")) return "zh" as const
+  }
+  return "en" as const
+}
+
+const getRootNotFoundError = () => {
+  const key = "error.dev.rootNotFound" as const
+  const locale = getLocale()
+  return locale === "zh" ? (zh[key] ?? en[key]) : en[key]
+}
 
 const root = document.getElementById("root")
-if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
-  const locale = (() => {
-    if (typeof navigator !== "object") return "en" as const
-    const languages = navigator.languages?.length ? navigator.languages : [navigator.language]
-    for (const language of languages) {
-      if (!language) continue
-      if (language.toLowerCase().startsWith("zh")) return "zh" as const
+if (!(root instanceof HTMLElement) && import.meta.env.DEV) {
+  throw new Error(getRootNotFoundError())
+}
+
+const clearAuthToken = () => {
+  const params = new URLSearchParams(location.search)
+  if (!params.has("auth_token")) return
+  params.delete("auth_token")
+  history.replaceState(null, "", location.pathname + (params.size ? `?${params}` : "") + location.hash)
+}
+
+const web = createWebPlatform(pkg.version)
+
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => void navigator.serviceWorker.register("/sw.js"), { once: true })
+}
+
+if (import.meta.env.VITE_SENTRY_DSN) {
+  init({
+    dsn: import.meta.env.VITE_SENTRY_DSN,
+    environment: import.meta.env.VITE_SENTRY_ENVIRONMENT ?? import.meta.env.MODE,
+    release: import.meta.env.VITE_SENTRY_RELEASE ?? `web@${pkg.version}`,
+    initialScope: {
+      tags: {
+        platform: "web",
+      },
+    },
+    integrations: (integrations) => {
+      return integrations.filter(
+        (i) =>
+          i.name !== "Breadcrumbs" && !(import.meta.env.OPENCODE_CHANNEL === "prod" && i.name === "GlobalHandlers"),
+      )
+    },
+  })
+}
+
+if (root instanceof HTMLElement && root.dataset.opencodeMounted === undefined) {
+  // Lazy chunks can import the entry chunk back under a distinct URL, so claim the root before async startup.
+  root.dataset.opencodeMounted = ""
+  void loadInitialLocale().then((locale) => {
+    const auth = authFromToken(new URLSearchParams(location.search).get("auth_token"))
+    clearAuthToken()
+    const server: ServerConnection.Http = {
+      type: "http",
+      authToken: !!auth,
+      http: {
+        url: web.currentServerUrl,
+        ...auth,
+      },
     }
-    return "en" as const
-  })()
-
-  const key = "error.dev.rootNotFound" as const
-  const message = locale === "zh" ? (zh[key] ?? en[key]) : en[key]
-  throw new Error(message)
+    render(
+      () => (
+        <PlatformProvider value={web.platform}>
+          <AppBaseProviders locale={locale}>
+            <AppInterface
+              defaultServer={ServerConnection.Key.make(web.defaultServerUrl)}
+              canonicalLocalServer={ServerConnection.key(server)}
+              servers={[server]}
+            />
+          </AppBaseProviders>
+        </PlatformProvider>
+      ),
+      root,
+    )
+  })
 }
-
-const platform: Platform = {
-  platform: "web",
-  version: pkg.version,
-  openLink(url: string) {
-    window.open(url, "_blank")
-  },
-  restart: async () => {
-    window.location.reload()
-  },
-  notify: async (title, description, href) => {
-    if (!("Notification" in window)) return
-
-    const permission =
-      Notification.permission === "default"
-        ? await Notification.requestPermission().catch(() => "denied")
-        : Notification.permission
-
-    if (permission !== "granted") return
-
-    const inView = document.visibilityState === "visible" && document.hasFocus()
-    if (inView) return
-
-    await Promise.resolve()
-      .then(() => {
-        const notification = new Notification(title, {
-          body: description ?? "",
-          icon: "https://opencode.ai/favicon-96x96-v3.png",
-        })
-        notification.onclick = () => {
-          window.focus()
-          if (href) {
-            window.history.pushState(null, "", href)
-            window.dispatchEvent(new PopStateEvent("popstate"))
-          }
-          notification.close()
-        }
-      })
-      .catch(() => undefined)
-  },
-}
-
-render(
-  () => (
-    <PlatformProvider value={platform}>
-      <AppBaseProviders>
-        <AppInterface />
-      </AppBaseProviders>
-    </PlatformProvider>
-  ),
-  root!,
-)

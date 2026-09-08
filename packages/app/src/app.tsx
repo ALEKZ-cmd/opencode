@@ -1,72 +1,90 @@
 import "@/index.css"
-import { ErrorBoundary, Show, lazy, type ParentProps } from "solid-js"
-import { Router, Route, Navigate } from "@solidjs/router"
-import { MetaProvider } from "@solidjs/meta"
-import { Font } from "@opencode-ai/ui/font"
-import { MarkedProvider } from "@opencode-ai/ui/context/marked"
-import { DiffComponentProvider } from "@opencode-ai/ui/context/diff"
-import { CodeComponentProvider } from "@opencode-ai/ui/context/code"
-import { I18nProvider } from "@opencode-ai/ui/context"
-import { Diff } from "@opencode-ai/ui/diff"
-import { Code } from "@opencode-ai/ui/code"
-import { ThemeProvider } from "@opencode-ai/ui/theme"
-import { GlobalSyncProvider } from "@/context/global-sync"
-import { PermissionProvider } from "@/context/permission"
-import { LayoutProvider } from "@/context/layout"
-import { GlobalSDKProvider } from "@/context/global-sdk"
-import { ServerProvider, useServer } from "@/context/server"
-import { SettingsProvider } from "@/context/settings"
-import { TerminalProvider } from "@/context/terminal"
-import { PromptProvider } from "@/context/prompt"
-import { FileProvider } from "@/context/file"
-import { CommentsProvider } from "@/context/comments"
-import { NotificationProvider } from "@/context/notification"
 import { DialogProvider } from "@opencode-ai/ui/context/dialog"
-import { CommandProvider } from "@/context/command"
-import { LanguageProvider, useLanguage } from "@/context/language"
-import { usePlatform } from "@/context/platform"
-import { Logo } from "@opencode-ai/ui/logo"
-import Layout from "@/pages/layout"
-import DirectoryLayout from "@/pages/directory-layout"
-import { ErrorPage } from "./pages/error"
-import { iife } from "@opencode-ai/util/iife"
-import { Suspense } from "solid-js"
+import { FileComponentProvider } from "@opencode-ai/ui/context/file"
+import { Font } from "@opencode-ai/ui/font"
+import { ThemeProvider } from "@opencode-ai/ui/theme/context"
+import { MetaProvider } from "@solidjs/meta"
+import { type BaseRouterProps, Router } from "@solidjs/router"
+import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
+import { type Component, createRenderEffect, ErrorBoundary, type JSX, type ParentProps } from "solid-js"
+import { Dynamic } from "solid-js/web"
+import { CommandProvider } from "@/shell/commands/command"
+import { DesktopCommands } from "@/shell/commands/desktop"
+import { GlobalProvider } from "@/runtime/server/runtime"
+import { HighlightsProvider } from "@/shell/updates/highlights"
+import { LanguageProvider, UiI18nBridge, type Locale } from "@/runtime/i18n/language"
+import { ServerConnection, ServersProvider } from "@/runtime/server/registry"
+import { SettingsProvider } from "@/settings/model"
+import { TabsProvider } from "@/shell/tabs/tabs"
+import { WslServersProvider } from "@/servers/wsl/context"
+import { ErrorPage } from "@/shell/errors/error"
+import { AppRoutes, File, preloadRoute } from "@/shell/routes/routes"
 
-const Home = lazy(() => import("@/pages/home"))
-const Session = lazy(() => import("@/pages/session"))
-const Loading = () => <div class="size-full" />
-
-function UiI18nBridge(props: ParentProps) {
-  const language = useLanguage()
-  return <I18nProvider value={{ locale: language.locale, t: language.t }}>{props.children}</I18nProvider>
-}
+export { preloadRoute }
 
 declare global {
   interface Window {
-    __OPENCODE__?: { updaterEnabled?: boolean; serverPassword?: string }
+    api?: {
+      setTitlebar?: (theme: { mode: "light" | "dark"; scheme?: "system" | "light" | "dark" }) => Promise<void>
+      exportDebugLogs?: () => Promise<string>
+    }
   }
 }
 
-function MarkedProviderWithNativeParser(props: ParentProps) {
-  const platform = usePlatform()
-  return <MarkedProvider nativeParser={platform.parseMarkdown}>{props.children}</MarkedProvider>
+function QueryProvider(props: ParentProps) {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        refetchOnReconnect: false,
+        refetchOnWindowFocus: false,
+        refetchOnMount: false,
+      },
+    },
+  })
+  return <QueryClientProvider client={client}>{props.children}</QueryClientProvider>
 }
 
-export function AppBaseProviders(props: ParentProps) {
+function BodyTypography() {
+  createRenderEffect(() => {
+    if (typeof document === "undefined") return
+    document.body.classList.remove("text-12-regular")
+    document.body.classList.add("font-(family-name:--font-family-text)", "text-[13px]", "font-[440]")
+  })
+
+  return null
+}
+
+export function AppBaseProviders(
+  props: ParentProps<{
+    locale?: Locale
+    onNativeTranslations?: Parameters<typeof LanguageProvider>[0]["onNativeTranslations"]
+    onThemeApplied?: (mode: "light" | "dark", scheme: "system" | "light" | "dark") => void
+  }>,
+) {
   return (
     <MetaProvider>
       <Font />
-      <ThemeProvider>
-        <LanguageProvider>
+      <ThemeProvider
+        onThemeApplied={(_, mode, scheme) => {
+          void window.api?.setTitlebar?.({ mode, scheme })
+          props.onThemeApplied?.(mode, scheme)
+        }}
+      >
+        <LanguageProvider locale={props.locale} onNativeTranslations={props.onNativeTranslations}>
           <UiI18nBridge>
-            <ErrorBoundary fallback={(error) => <ErrorPage error={error} />}>
-              <DialogProvider>
-                <MarkedProviderWithNativeParser>
-                  <DiffComponentProvider component={Diff}>
-                    <CodeComponentProvider component={Code}>{props.children}</CodeComponentProvider>
-                  </DiffComponentProvider>
-                </MarkedProviderWithNativeParser>
-              </DialogProvider>
+            <ErrorBoundary
+              fallback={(error) => {
+                void import("@sentry/solid").then(({ captureException }) => captureException(error))
+                return <ErrorPage error={error} />
+              }}
+            >
+              <QueryProvider>
+                <WslServersProvider>
+                  <DialogProvider>
+                    <FileComponentProvider component={File}>{props.children}</FileComponentProvider>
+                  </DialogProvider>
+                </WslServersProvider>
+              </QueryProvider>
             </ErrorBoundary>
           </UiI18nBridge>
         </LanguageProvider>
@@ -75,78 +93,42 @@ export function AppBaseProviders(props: ParentProps) {
   )
 }
 
-function ServerKey(props: ParentProps) {
-  const server = useServer()
-  return (
-    <Show when={server.url} keyed>
-      {props.children}
-    </Show>
+export function AppInterface(props: {
+  children?: JSX.Element
+  defaultServer: ServerConnection.Key
+  canonicalLocalServer?: ServerConnection.Key
+  servers?: Array<ServerConnection.Any>
+  router?: Component<BaseRouterProps>
+}) {
+  // The visual layout lives in the router root so it remains mounted across
+  // route changes. Draft and session routes override only their server-bound data
+  // providers beneath it.
+  const Root = (rootProps: ParentProps) => (
+    <TabsProvider>
+      <GlobalProvider>
+        <BodyTypography />
+        <CommandProvider>
+          <DesktopCommands />
+          <HighlightsProvider>
+            {props.children}
+            {rootProps.children}
+          </HighlightsProvider>
+        </CommandProvider>
+      </GlobalProvider>
+    </TabsProvider>
   )
-}
-
-export function AppInterface(props: { defaultUrl?: string }) {
-  const defaultServerUrl = () => {
-    if (props.defaultUrl) return props.defaultUrl
-    if (location.hostname.includes("opencode.ai")) return "http://localhost:4096"
-    if (import.meta.env.DEV)
-      return `http://${import.meta.env.VITE_OPENCODE_SERVER_HOST ?? "localhost"}:${import.meta.env.VITE_OPENCODE_SERVER_PORT ?? "4096"}`
-
-    return window.location.origin
-  }
 
   return (
-    <ServerProvider defaultUrl={defaultServerUrl()}>
-      <ServerKey>
-        <GlobalSDKProvider>
-          <GlobalSyncProvider>
-            <Router
-              root={(props) => (
-                <SettingsProvider>
-                  <PermissionProvider>
-                    <LayoutProvider>
-                      <NotificationProvider>
-                        <CommandProvider>
-                          <Layout>{props.children}</Layout>
-                        </CommandProvider>
-                      </NotificationProvider>
-                    </LayoutProvider>
-                  </PermissionProvider>
-                </SettingsProvider>
-              )}
-            >
-              <Route
-                path="/"
-                component={() => (
-                  <Suspense fallback={<Loading />}>
-                    <Home />
-                  </Suspense>
-                )}
-              />
-              <Route path="/:dir" component={DirectoryLayout}>
-                <Route path="/" component={() => <Navigate href="session" />} />
-                <Route
-                  path="/session/:id?"
-                  component={(p) => (
-                    <Show when={p.params.id ?? "new"}>
-                      <TerminalProvider>
-                        <FileProvider>
-                          <PromptProvider>
-                            <CommentsProvider>
-                              <Suspense fallback={<Loading />}>
-                                <Session />
-                              </Suspense>
-                            </CommentsProvider>
-                          </PromptProvider>
-                        </FileProvider>
-                      </TerminalProvider>
-                    </Show>
-                  )}
-                />
-              </Route>
-            </Router>
-          </GlobalSyncProvider>
-        </GlobalSDKProvider>
-      </ServerKey>
-    </ServerProvider>
+    <ServersProvider
+      defaultServer={props.defaultServer}
+      canonicalLocalServer={props.canonicalLocalServer}
+      servers={props.servers}
+    >
+      <SettingsProvider>
+        <Dynamic component={props.router ?? Router} root={Root}>
+          <AppRoutes />
+        </Dynamic>
+      </SettingsProvider>
+    </ServersProvider>
   )
 }

@@ -1,0 +1,111 @@
+import { expect, test, type Page, type Route } from "@playwright/test"
+import { base64Encode } from "@opencode-ai/util/encode"
+import { currentSession } from "../utils/mock-server"
+
+const serverA = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`
+const serverB = "http://127.0.0.1:4097"
+const sessionA = session("ses_server_a", "C:/server-a", "Server A session")
+const sessionB = session("ses_server_b", "/home/server-b", "Server B session")
+
+test("tab busy indicator reflects the tab server's own session status", async ({ page }) => {
+  await mockServers(page)
+  await page.addInitScript(
+    ({ serverA, serverB, sessionA, sessionB }) => {
+      localStorage.setItem("opencode.global.dat:server", JSON.stringify({ list: [serverB] }))
+      localStorage.setItem(
+        "opencode.window.browser.dat:tabs",
+        JSON.stringify([
+          { type: "session", server: serverA, sessionId: sessionA },
+          { type: "session", server: serverB, sessionId: sessionB },
+        ]),
+      )
+    },
+    { serverA, serverB, sessionA: sessionA.id, sessionB: sessionB.id },
+  )
+
+  const hrefA = `/server/${base64Encode(serverA)}/session/${sessionA.id}`
+  const hrefB = `/server/${base64Encode(serverB)}/session/${sessionB.id}`
+  await page.goto(hrefA)
+  await expect(page.getByText(sessionA.title).first()).toBeVisible()
+
+  // Session B is busy on server B while server A stays the active server, so the
+  // busy indicator must come from the tab server's status, not the active server's.
+  const tabB = page.locator(`[data-titlebar-tab-slot]:has(a[href="${hrefB}"])`)
+  await expect(tabB.locator('[data-component="session-progress-indicator-v2"]')).toBeVisible()
+
+  const tabA = page.locator(`[data-titlebar-tab-slot]:has(a[href="${hrefA}"])`)
+  await expect(tabA.locator("[data-titlebar-tab-title]")).toHaveText(sessionA.title)
+  await expect(tabA.locator('[data-component="session-progress-indicator-v2"]')).toHaveCount(0)
+})
+
+function session(id: string, directory: string, title: string) {
+  return {
+    id,
+    slug: id,
+    projectID: `project-${id}`,
+    directory,
+    title,
+    version: "dev",
+    time: { created: 1, updated: 1 },
+  }
+}
+
+async function mockServers(page: Page) {
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url())
+    if (url.origin !== serverA && url.origin !== serverB) return route.fallback()
+    const current = url.origin === serverA ? sessionA : sessionB
+    const directory = url.searchParams.get("directory")
+    if (directory && directory !== current.directory) return json(route, { name: "InvalidDirectory" }, 500)
+    if (url.pathname === "/api/event") return sse(route)
+    if (url.pathname === "/api/health") return json(route, { pid: 1 })
+    if (url.pathname === "/api/session/active")
+      return json(route, { data: url.origin === serverB ? { [sessionB.id]: { type: "running" } } : {} })
+    if (url.pathname === "/api/session") return json(route, { data: [currentSession(current)], cursor: {} })
+    if (url.pathname === `/api/session/${current.id}`) return json(route, { data: currentSession(current) })
+    if (url.pathname === `/api/session/${current.id}/message`) return json(route, { data: [], cursor: {} })
+    if (["/api/agent", "/api/provider", "/api/model", "/api/command", "/api/reference"].includes(url.pathname))
+      return json(route, { location: { directory: current.directory }, data: [] })
+    if (url.pathname === "/api/model/default")
+      return json(route, { location: { directory: current.directory }, data: null })
+    if (url.pathname === "/api/permission/request" || url.pathname === "/api/question/request")
+      return json(route, { location: { directory: current.directory }, data: [] })
+    if (url.pathname === "/api/mcp") return json(route, { location: { directory: current.directory }, data: [] })
+    if (url.pathname === "/api/mcp/resource")
+      return json(route, { location: { directory: current.directory }, data: { resources: [], templates: [] } })
+    if (url.pathname === "/api/project" || url.pathname === "/api/project/current") {
+      const project = {
+        id: current.projectID,
+        canonical: current.directory,
+        vcs: "git",
+        time: { created: 1, updated: 1 },
+        sandboxes: [],
+      }
+      return json(route, url.pathname === "/api/project" ? [project] : { id: project.id, directory: current.directory })
+    }
+    if (url.pathname === "/api/location") return json(route, { directory: current.directory })
+    if (url.pathname === "/api/vcs")
+      return json(route, {
+        location: { directory: current.directory },
+        data: { branch: "main", defaultBranch: "main" },
+      })
+    return json(route, {})
+  })
+}
+
+function json(route: Route, body: unknown, status = 200) {
+  return route.fulfill({
+    status,
+    contentType: "application/json",
+    headers: { "access-control-allow-origin": "*" },
+    body: JSON.stringify(body),
+  })
+}
+
+function sse(route: Route) {
+  return route.fulfill({
+    status: 200,
+    contentType: "text/event-stream",
+    body: 'data: {"id":"evt_connected","type":"server.connected","data":{}}\n\n',
+  })
+}

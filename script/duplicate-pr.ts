@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
+/* TODO: Migrate this script to the new in-process @opencode-ai/sdk.
 import path from "path"
+import { pathToFileURL } from "bun"
 import { createOpencode } from "@opencode-ai/sdk"
 import { parseArgs } from "util"
 
@@ -49,7 +51,7 @@ Examples:
       }
       parts.push({
         type: "file",
-        url: `file://${resolved}`,
+        url: pathToFileURL(resolved).href,
         filename: path.basename(resolved),
         mime: "text/plain",
       })
@@ -75,4 +77,5 @@ Examples:
   }
 }
 
-main()
+void main()
+*/
